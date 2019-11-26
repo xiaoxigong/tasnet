@@ -1,0 +1,175 @@
+import torch
+import torchvision
+import torch.optim as optim
+import torchvision.transforms as transforms
+import padertorch as pt
+from padertorch.train.trainer import Trainer
+from padertorch.train.optimizer import Optimizer
+import sacred
+
+ex = sacred.Experiment()
+
+# We transform them to Tensors of normalized range [-1, 1].
+
+transform = transforms.Compose(
+    [transforms.ToTensor(),
+     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+
+trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
+                                        download=False, transform=transform)
+trainloader = torch.utils.data.DataLoader(trainset, batch_size=4,
+                                          shuffle=True, num_workers=2)
+
+testset = torchvision.datasets.CIFAR10(root='./data', train=False,
+                                       download=False, transform=transform)
+testloader = torch.utils.data.DataLoader(testset, batch_size=4,
+                                         shuffle=False, num_workers=2)
+
+classes = ('plane', 'car', 'bird', 'cat',
+           'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
+
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Net(pt.Model):
+    loss_function = nn.CrossEntropyLoss()
+
+    def __init__(self):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(3, 6, 5)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(6, 16, 5)
+        self.fc1 = nn.Linear(16 * 5 * 5, 120)  # hidden_layer_1 with layer_size_1 = 120
+        self.fc2 = nn.Linear(120, 84)  # hidden_layer_2 with layer_size_2 = 84
+        self.fc3 = nn.Linear(84, 10)  # prediction = output
+
+    def forward(self, inputs):
+        x = inputs[0]
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = x.view(-1, 16 * 5 * 5)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+    def review(self, inputs, outputs):
+        loss = self.loss_function(
+            outputs,
+            inputs[1]
+        )
+
+        _, predicted = torch.max(outputs, 1)
+
+        acc = (predicted == inputs[1]).sum().item() / len(inputs[1])
+
+        return dict(
+            loss=loss,
+            scalars={'Accuracy': acc},
+            images={'image': inputs[0][0]},
+            texts={
+                'label': classes[inputs[1][0].data],
+                'predicted': classes[predicted[0].data],
+            },
+        )
+
+
+net = Net()
+
+def train(net, trainloader, gpu=False):
+    device = None
+
+    if gpu and torch.cuda.is_available():
+        device = torch.device("cuda")
+        net.to(device)
+
+    # Set loss function and training algorithm
+    loss_function = nn.CrossEntropyLoss()
+    optimizer = optim.SGD(net.parameters(), lr=0.01, momentum=0.9)
+
+    accum_loss = 0.0
+    for it, (images, labels) in enumerate(trainloader, 0):
+        if gpu:
+            images, labels = images.to(device), labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = net(images)
+        loss = loss_function(outputs, labels)
+
+        loss.backward()
+        optimizer.step()
+
+        accum_loss += loss.item()
+
+        # CPU is slow, use this to still get some kind of feedback
+        # if it % 2500 == 2499:
+        #     print("Iteration %d" % (it+1))
+
+    return accum_loss
+
+
+def validate(net, testloader, gpu=False):
+    device = None
+
+    if gpu and torch.cuda.is_available():
+        device = torch.device("cuda")
+
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for images, labels in testloader:
+            if device:
+                images, labels = images.to(device), labels.to(device)
+
+            outputs = net(images)
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    return correct
+
+#lets's training
+import os
+from padertorch.train.trainer import Trainer
+import padertorch.train.optimizer as pt_opt
+
+@ex.config
+def config():
+        use_pt = True  # Use trainer from pt
+        checkpoint_trigger = 2000
+        epochs = 2  # Use resume=True to train for more epochs
+        resume = False  # PT: Continue from checkpoints
+        storage_dir = '/net/vol/zhenyuw/my_first_training'
+
+
+
+@ex.automain
+def main(_config, use_pt,checkpoint_trigger,epochs,resume,storage_dir):
+    if use_pt:
+        model = Net()           #Model(net=net)
+        optimizer = pt_opt.SGD(lr=0.001, momentum=0.9)
+
+        trainer = Trainer(model,
+                  storage_dir=storage_dir,
+                  optimizer=optimizer,
+                  lr_scheduler=None,
+                  loss_weights=None,
+                  summary_trigger=(1000, 'iteration'),
+                  checkpoint_trigger=(checkpoint_trigger, 'iteration'),
+                  keep_all_checkpoints=False,
+                  max_trigger=(epochs, 'epoch'),
+                  virtual_minibatch_size=1,
+                 )
+
+# trainer.test_run(trainloader,
+#                 testloader)
+
+        try:
+            trainer.train(trainloader,
+                          testloader,
+                           resume=resume
+                         )
+        except Exception:
+            print('#' * 1000)
+            raise
