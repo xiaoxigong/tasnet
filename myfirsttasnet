@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from padertorch.train.trainer import Trainer
 from padertorch.ops.losses.loss import pit_loss
 import numpy as np
+from paderbox.io.play import play
 
 ex = sacred.Experiment()
 
@@ -20,16 +21,16 @@ def transform(example):
 
 #def get_iterators():
 provider_config = dict(
-        database= dict(factory='paderbox.database.merl_mixtures.MerlMixtures'),
-        audio_keys=[keys.OBSERVATION, keys.SPEECH_SOURCE],
-        batch_size=None,
-        batch_size_eval=None,
-    )
+                        database= dict(factory='paderbox.database.merl_mixtures.MerlMixtures'),
+                        audio_keys=[keys.OBSERVATION, keys.SPEECH_SOURCE],
+                        batch_size=None,
+                        batch_size_eval=None,
+                        )
 provider_config = SequenceProvider.get_config(provider_config)
 provider = SequenceProvider.from_config(provider_config)
 provider.transform = transform
 train_iterator = provider.get_train_iterator()
-test_iterator = provider.get_eval_iterator()
+test_iterator = provider.get_eval_iterator(num_examples=100)
 #return train_iterator, test_iterator
 
 
@@ -51,7 +52,7 @@ class Tasnet(pt.Model):
     tensor(0)
     >>> print(out.shape)
     torch.Size([2, 1039])
-    >>> review = net.review(dict(observation=signal, speech_source=target), out)
+    >>> review = net.review(dict(observation=signal,speech_source=target), out)
     >>> print(review)
     {'loss': tensor(100., grad_fn=<MinBackward1>)}
     """
@@ -76,9 +77,9 @@ class Tasnet(pt.Model):
         self.decoder = Decoder(L,N)
 
     def forward(self, mixture):
-        weight = self.encoder(mixture)                  # [B,Padding_T/L,N]
-        est_mask = self.separator(weight)               # [B,N,C,Padding_T/L]
-        out = self.decoder(weight, est_mask)       # [Padding_T]
+        weight = self.encoder(mixture)                          # [B,Padding_T/L,N]
+        est_mask = self.separator(weight)                       # [B,N,C,Padding_T/L]
+        out = self.decoder(weight, est_mask)                    # [Padding_T]
         #remove padding
         x = mixture['observation']
         assert x.dim() == 1, x.size()
@@ -93,16 +94,20 @@ class Tasnet(pt.Model):
 
             else:
                 out = out[:, int((zerosize-1)/2):int(-(zerosize+1)/2)]
-        return out                #[C, T]
+        return out                                                          #[C, T]
 
 
     def review(self,mixture,output):
 
-        clean = mixture[keys.SPEECH_SOURCE][None].permute(2,1,0)        # C T -> T C 1
-        output = output[None].permute(2,1,0)                                 # C T -> T C 1
+        clean = mixture[keys.SPEECH_SOURCE][None].permute(2,1,0)            # C T -> T C 1
+        output = output[None].permute(2,1,0)                                # C T -> T C 1
+        #print("output.shape=",output.shape)
+
         def si_snr_loss(output, clean):
-            out = output[..., 0].permute(1,0) # T C 1 -> C T
-            clean = clean[..., 0].permute(1,0) # T C 1 -> C T
+            out = output[..., 0].permute(1,0)                               # T C 1 -> C T
+            clean = clean[..., 0].permute(1,0)                              # T C 1 -> C T
+            #print('out.size=',out.shape)
+            #print('clean.size=',clean.shape)
 
             assert out.size() == clean.size(), (out.size(), clean.size())
             clean = clean - torch.mean(clean)
@@ -112,16 +117,23 @@ class Tasnet(pt.Model):
 
             noise = out - target
 
-            SISNR = 10*torch.log10(torch.sum(torch.pow(target,2))/(
-                torch.sum(torch.pow(noise,2))) + 1e-10)
+            SISNR = 10*torch.log10(torch.sum(torch.pow(target,2))/(torch.sum(torch.pow(noise,2))) + 1e-10)
             return -torch.sum(SISNR)
 
+        mixture = mixture['observation']                                   # T C 1-> T
+        #print('mixture=',mixture.shape)
+        speaker1 = torch.squeeze(output[:,0])                                # T C 1-> T
+        #print('speaker',speaker1.shape)
+        speaker2 = torch.squeeze(output[:,1])                                # T C 1-> T
 
-        return {
-                # 'scalars' : {'SISNR1': SISNR1,
-                #               'SISNR2': SISNR2,},
-                    'loss': pit_loss(output, clean, si_snr_loss)
-                    }
+
+
+        return {'loss': pit_loss(output, clean, si_snr_loss),
+                'audios':{'mixture': (mixture,8000),
+                          'speaker1': (speaker1,8000),
+                          'speaker2': (speaker2, 8000),
+                         }
+                }
 
 
 
@@ -159,7 +171,7 @@ class Encoder(nn.Module):
 
 
     def forward(self,mixture):
-        x = mixture['observation']          # mixture[B,T]
+        x = mixture['observation']          # mixture[T]
         if x.dim() == 1:
             x = torch.unsqueeze(x,0)        # [1,T]
         if x.shape[-1] % self.L  == 0:
@@ -230,19 +242,6 @@ class Separator(nn.Module):
                              batch_first,
                              bidirectional
                              )
-        #alternative
-        #self.lstm = nn.LSTM(N,
-        #                    hidden_size,
-        #                    num_layers,
-        #                    batch_first,
-        #                    bidirectional
-        #                    )
-        #self.lstm += nn.LSTM(N = 500,
-        #                     hiddden_size = 1000,
-        #                     num_layers = 2,
-        #                     batch_first= True,
-        #                     bidirectional = False
-        #                     )
 
         self.fc = nn.Linear(hidden_size, self.C * self.N)
 
@@ -268,9 +267,9 @@ class Decoder(nn.Module):
         >>> weight = torch.ones(1,50,500)
         >>> est_mask = torch.ones(1, 500, 2, 50)
         >>> dec = Decoder(20,500)
-        >>> out1,out2 = dec(weight,est_mask)
-        >>> print(out1.shape)
-        torch.Size([1000])
+        >>> out= dec(weight,est_mask)
+        >>> print(out.shape)
+        torch.Size([2,1000])
 
 
 
@@ -289,20 +288,14 @@ class Decoder(nn.Module):
     def forward(self,weight,est_mask):
         # C is number of speaker
         # D = weight*Mask
-        expand_weight = weight[:,:,None,:]                 #[B,Padding_T/L,1,N]
-        decoder = expand_weight.permute(0,3,2,1)*est_mask  #[B,N,1,Padding_T/L]*[B,N,C,Padding_T/L]
+        expand_weight = weight[:,:,None,:]                  #[B,Padding_T/L,1,N]
+        decoder = expand_weight.permute(0,3,2,1)*est_mask   #[B,N,1,Padding_T/L]*[B,N,C,Padding_T/L]->[B,N,C,PaddingT/L]
         # S = Decoder*Basis_signal
-        #reconstruction = self.basis_signals(decoder)       #[B,T/L,C,L]
-        #overlap_and_add
-        #reconstruction =  overlap_and_add(reconstrction,self.L)   #[B,C,T]
-        # d1 = decoder[:,:,0,:]                               #[B,N,Padding_T/L]
-        # d2 = decoder[:,:,1,:]                               #[B,N,Padding_T/L]
         #inverse convolution
-        out = self.inverse(decoder[0].permute(1, 0, 2))                             #[B,1,Padding_T]
-        # out2 = self.inverse(d2)                             #[B,1,Padding_T]
+        out = self.inverse(decoder[0].permute(1, 0, 2))      #[C,N,padding_T/L]->[C,1,Padding_T]
         #squeeze
-        out = torch.squeeze(out)                          #[C,Padding_T]
-        # out2 = torch.squeeze(out2)                          #[B,Padding_T]
+        out = torch.squeeze(out)                             #[C,Padding_T]
+
 
         return out
 
@@ -324,6 +317,7 @@ def config():
 
 @ex.automain
 def main(tasnet_config,use_pt,epochs,storage_dir):
+
     if use_pt:
         model = Tasnet(**tasnet_config)
         optimizer = pt_opt.Adam()
@@ -334,14 +328,17 @@ def main(tasnet_config,use_pt,epochs,storage_dir):
                           lr_scheduler=None,
                           loss_weights=None,
                           summary_trigger=(1000, 'iteration'),
-                          checkpoint_trigger=(1000, 'iteration'),
+                          checkpoint_trigger=(100, 'iteration'),
                           keep_all_checkpoints=False,
                           max_trigger=(epochs, 'epoch'),
                           virtual_minibatch_size=1,
                           )
 
-        trainer.test_run(train_iterator, test_iterator)
+        trainer.test_run(train_iterator,
+                         test_iterator)
 
 
-        trainer.train(train_iterator, test_iterator,
-                      resume=False)
+        trainer.train(train_iterator,
+                      test_iterator,
+                      resume=False,
+                      device=0)
