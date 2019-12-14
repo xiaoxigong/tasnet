@@ -215,7 +215,6 @@ class Separator(nn.Module):
         >>> out = sep(weight)
         >>> print(out.shape)
         torch.Size([1, 500, 2, 50])
-
     """
 
 
