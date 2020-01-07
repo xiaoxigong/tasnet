@@ -1,0 +1,344 @@
+from paderbox.database import keys
+from padertorch.contrib.jensheit.data import SequenceProvider, MaskTransformer, STFT
+import sacred
+import torch
+import torch.nn as nn
+import padertorch as pt
+import padertorch.train.optimizer as pt_opt
+import torch.nn.functional as F
+from padertorch.train.trainer import Trainer
+from padertorch.ops.losses.loss import pit_loss
+import numpy as np
+from tasnet_stft.desecting_tasnet.tasnet import si_loss
+from pathlib import Path
+
+ex = sacred.Experiment()
+
+def transform(example):
+    example[keys.OBSERVATION] = example[keys.OBSERVATION].astype(np.float32)
+    example[keys.SPEECH_SOURCE] = example[keys.SPEECH_SOURCE].astype(np.float32)
+    return example
+
+def get_provider():
+    provider_config = dict(
+        database= dict(factory='paderbox.database.merl_mixtures.MerlMixtures'),
+        audio_keys=[keys.OBSERVATION, keys.SPEECH_SOURCE],
+        batch_size=8,
+        time_segments=32000,
+        collate=dict(factory='padertorch.contrib.jensheit.data.Padder',
+                     padding=True),
+        padding_keys=[keys.OBSERVATION, keys.SPEECH_SOURCE],
+        batch_size_eval=1,
+    )
+    provider_config = SequenceProvider.get_config(provider_config)
+    provider = SequenceProvider.from_config(provider_config)
+    provider.transform = transform
+    return provider
+
+
+# test_iterator = provider.get_predict_iterator()
+#return train_iterator, test_iterator
+
+
+#hyperparameter
+# B = Batch
+# T = Sample time
+# L = Lenth of filters
+# T/L = Padding_L
+# N = number of output channels
+# C = number of sources
+
+class Tasnet(pt.Model):
+    """
+    >>> signal = torch.ones(1039)
+    >>> target = torch.ones(2, 1039)
+    >>> net = Tasnet(20, 500,1000,4,True,False,2)
+    >>> out = net(dict(observation=signal))
+    >>> print(torch.sum(torch.isnan(out)))
+    tensor(0)
+    >>> print(out.shape)
+    torch.Size([2, 1039])
+    >>> review = net.review(dict(observation=signal,speech_source=target), out)
+    >>> print(review)
+    {'loss': tensor(100., grad_fn=<MinBackward1>)}
+    """
+    def __init__(self,L, N, hidden_size,num_layers,batch_first,bidirectional,C):
+        super(Tasnet, self).__init__()
+
+        self.L = L
+        self.N = N
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.batch_first = batch_first
+        self.bidirectional = bidirectional
+        self.C = C
+
+        self.encoder = Encoder(L,N)
+        self.separator = Separator(N,
+                                   hidden_size,
+                                   num_layers,
+                                   batch_first,
+                                   bidirectional,
+                                   C)
+        self.decoder = Decoder(L,N)
+
+    def forward(self, mixture):
+        weight = self.encoder(mixture)                          # [B,Padding_T/L,N]
+        est_mask = self.separator(weight)                       # [B,N,C,Padding_T/L]
+        out = self.decoder(weight, est_mask)                    # [Padding_T]
+        #remove padding
+        x = mixture['observation']
+        assert x.dim() == 1, x.size()
+        if x.shape[-1] % int(self.L/2) == 0:
+            out = out
+        else:
+            mod = x.shape[-1] % int(self.L/2)  # mod = T mod L
+            zerosize = self.L/2 - mod
+
+            if zerosize % 2 == 0:
+                out = out[:, int(zerosize / 2):int(-zerosize/2)]
+
+            else:
+                out = out[:, int((zerosize-1)/2):int(-(zerosize+1)/2)]
+        return out                                                          #[C, T]
+
+
+    def review(self,mixture,output):
+
+        clean = mixture[keys.SPEECH_SOURCE][None].permute(2,1,0)            # C T -> T C 1
+        output = output[None].permute(2,1,0)                                # C T -> T C 1
+        #print("output.shape=",output.shape)
+
+        def si_snr_loss(output,clean):
+            estimate = output.permute(2,1,0)
+            target = clean.permute(2,1,0)
+
+            loss = si_loss(estimate, target, eps=1e-10)              #(B C T)
+            return loss
+
+
+        mixture = mixture['observation']                                   # T C 1-> T
+        #print('mixture=',mixture.shape)
+        speaker1 = torch.squeeze(output[:,0])                                # T C 1-> T
+        #print('speaker',speaker1.shape)
+        speaker2 = torch.squeeze(output[:,1])                                # T C 1-> T
+
+
+
+        return {'loss': pit_loss(output, clean, si_snr_loss),
+                'audios':{'mixture': (mixture,8000),
+                          'speaker1': (speaker1,8000),
+                          'speaker2': (speaker2, 8000),
+                         }
+                }
+
+
+
+
+# signal = torch.ones(4,1000)
+# enc = Encoder(20, 500)
+# out = enc(signal)
+# assert out.shape == (4, 500, 1000/20)
+
+class Encoder(nn.Module):
+    """
+    >>> signal = torch.ones(1035, dtype=torch.float32)
+    >>> enc = Encoder(20, 500)
+    >>> out = enc(dict(observation=signal))
+    >>> print(out.shape)
+    torch.Size([1, 52, 500])
+     """
+
+    def __init__(self, L, N):                   #kernel_size=L, stride = L/2
+        super(Encoder, self).__init__()
+
+        self.L = L
+        self.N = N
+        self.conv1 = nn.Conv1d(in_channels = 1,
+                               out_channels = N,
+                               kernel_size = L,
+                               stride = int(L/2)
+                               )
+        self.conv2 = nn.Conv1d(in_channels=1,
+                               out_channels=N,
+                               kernel_size=L,
+                               stride=int(L/2)
+                               )
+
+
+
+    def forward(self,mixture):
+        x = mixture['observation']          # mixture[T]
+        if x.dim() == 1:
+            x = torch.unsqueeze(x,0)        # [1,T]
+        if x.shape[-1] % int(self.L/2)  == 0:
+            new_x = x
+
+        else:
+        #padding
+          mod = x.shape[-1] % int(self.L/2)        # mod = T mod L
+          zerosize = int(self.L/2) - mod
+          pad = x.new(np.zeros((1,zerosize), np.float32))
+
+          if zerosize%2 == 0:
+            frontzeros = pad[:,0:int(zerosize/2)]
+            backzeros = pad[:,0:int(zerosize/2)]
+            new_x = torch.cat((frontzeros,x),dim=1)       #pad zeros in front
+            new_x = torch.cat((new_x,backzeros),dim=1)   # pad zeros behind
+
+          else:
+            frontzeros = pad[:,0:int((zerosize-1)/2)]
+            backzeros = pad[:,0:int((zerosize+1)/2)]
+            new_x = torch.cat((frontzeros, x),dim=1)
+            new_x = torch.cat((new_x, backzeros),dim=1)
+        x = torch.unsqueeze(new_x, 1)
+        # x = x[:,None,:]               # [B,1,Padding_T]
+
+        x1 = self.conv1(x)              # [B,N,padding_T/L]
+        x2 = self.conv2(x)
+        fc1 = torch.relu(x1)
+        fc2 = torch.sigmoid(x2)
+        weight = fc1*fc2
+        weight = weight.permute(0,2,1)  # [B,Padding_T/L,N]
+
+        return weight
+
+
+
+class Separator(nn.Module):
+    """
+        >>> weight = torch.ones(1,50,500)
+        >>> sep = Separator(500,1000,4,True,False,2)
+        >>> out = sep(weight)
+        >>> print(out.shape)
+        torch.Size([1, 500, 2, 50])
+    """
+
+
+    def __init__(self,N,hidden_size,num_layers,batch_first,bidirectional,C):
+        super(Separator, self).__init__()
+        self.N = N
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.C = C
+
+        self.layer_norm = nn.LayerNorm(N)   #layer nomalization
+
+        self.lstm1 = nn.LSTM(N,
+                            hidden_size,
+                            num_layers,
+                            batch_first,
+                            bidirectional
+                            )
+        #skip connection #not sure add net or add output
+        self.lstm2 = nn.LSTM(N,
+                             hidden_size,
+                             2,
+                             batch_first,
+                             bidirectional
+                             )
+
+        self.fc = nn.Linear(hidden_size, self.C * self.N)
+
+    def forward(self,weight):
+        normalization = self.layer_norm(weight)
+
+        out1, _ = self.lstm1(normalization)                   #[B,Padding_T/L,hidden_size]
+        out2, _ = self.lstm2(normalization)
+        out = out1 + out2
+        out = self.fc(out)                             #[B,Padding_T/L,C*N]
+        out = out.view(1,-1,self.C,self.N)             #[B,Padding_T/L,C,N]
+        out = out.permute(0,3,2,1)                     #[B,N,C,Padding_T/L]
+        #est_mask1, est_mask2 = out2.split(N, dim=1)   #[B,N,C,Padding_T/L]
+        #softmax
+        est_mask = F.softmax(out,dim=2)
+
+        return est_mask                                 #[B,N,C,Padding_T/L]
+
+
+
+class Decoder(nn.Module):
+    """
+        >>> weight = torch.ones(1,50,500)
+        >>> est_mask = torch.ones(1, 500, 2, 50)
+        >>> dec = Decoder(20,500)
+        >>> out= dec(weight,est_mask)
+        >>> print(out.shape)
+        torch.Size([2,1000])
+
+
+
+    """
+    def __init__(self, L, N):
+        super(Decoder, self).__init__()
+        self.N = N
+        self.L = L
+        #inverse_convolution
+        self.inverse = nn.ConvTranspose1d(in_channels = N,
+                                          out_channels= 1,
+                                          kernel_size = L,
+                                          stride = int(L/2)
+                                          )
+
+    def forward(self,weight,est_mask):
+        # C is number of speaker
+        # D = weight*Mask
+        expand_weight = weight[:,:,None,:]                  #[B,Padding_T/L,1,N]
+        decoder = expand_weight.permute(0,3,2,1)*est_mask   #[B,N,1,Padding_T/L]*[B,N,C,Padding_T/L]->[B,N,C,PaddingT/L]
+        # S = Decoder*Basis_signal
+        #inverse convolution
+        out = self.inverse(decoder[0].permute(1, 0, 2))      #[C,N,padding_T/L]->[C,1,Padding_T]
+        #squeeze
+        out = torch.squeeze(out)                             #[C,Padding_T]
+
+
+        return out
+
+
+@ex.config
+def config():
+        tasnet_config = {
+                        'L': 40,
+                        'N': 500,
+                        'hidden_size': 1000,
+                        'num_layers' : 4,
+                        'batch_first': True,
+                        'bidirectional': False,
+                        'C': 2
+                        }
+        use_pt = True
+        epochs = 2
+
+@ex.automain
+def main(tasnet_config,use_pt,epochs):
+    assert len(ex.current_run.observers) == 1, (
+        'FileObserver` missing. Add a `FileObserver` with `-F foo/bar/`.'
+    )
+    storage_dir = Path(ex.current_run.observers[0].basedir)
+
+    if use_pt:
+        model = Tasnet(**tasnet_config)
+        optimizer = pt_opt.Adam()
+        provider = get_provider()
+        train_iterator = provider.get_train_iterator()
+        validation_iterator = provider.get_eval_iterator(num_examples=100)
+
+        trainer = Trainer(model,
+                          storage_dir=storage_dir,
+                          optimizer=optimizer,
+                          loss_weights=None,
+                          summary_trigger=(250, 'iteration'),
+                          checkpoint_trigger=(1000, 'iteration'),
+                          )
+
+        trainer.test_run(train_iterator,
+                         validation_iterator)
+
+        trainer.register_validation_hook(validation_iterator)
+
+        trainer.train(train_iterator,
+                      resume=False,
+                      device=0,
+                      progress_bar=False
+                      )
