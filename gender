@@ -1,0 +1,139 @@
+#python BachelorarbeitPython/tasnet_py/changespeakernumbers.py -F $STORAGE_ROOT/test/gender/male
+
+import torch
+import numpy as np
+from padercontrib.database import keys
+from padertorch.contrib.jensheit.data import SequenceProvider
+import padertorch.train.optimizer as pt_opt
+from desecting_tasnet.model import TasnetModel,TasnetTransformer
+from padertorch.train.trainer import Trainer
+from pathlib import Path
+from paderbox import io
+import lazy_dataset
+import sacred
+
+
+ex = sacred.Experiment()
+
+def transform(example):
+    def new_transform(example):
+        example['observation_abs'] = example[keys.OBSERVATION][None].astype(np.float32)  #dimension problems
+        example[keys.SPEECH_SOURCE] = example[keys.SPEECH_SOURCE][None].astype(np.float32) #dimension problems
+        return example
+    if isinstance(example, (list, tuple)):
+        return [new_transform(ex) for ex in example]
+    else:
+        return new_transform(example)
+
+
+
+from dataclasses import dataclass
+from functools import partial
+class Provider(SequenceProvider):
+
+    @dataclass
+    class opts(SequenceProvider.opts):
+        gender: str = 'all'
+
+    def filter_iterator(self, iterator):
+        if self.opts.gender == 'all':
+            return iterator
+
+        def detect_gender(example):
+            if example['gender'] == ["male", "male"]:
+                return 'mm'
+            elif example['gender'] == ["female", "female"]:
+                return 'ff'
+            elif example['gender'] == ["female", "male"]\
+                    or example['gender'] == ["male", "female"]:
+                return 'mix'
+
+        dataset_dict = iterator.groupby(detect_gender)
+        return dataset_dict[self.opts.gender]
+
+    def get_train_iterator(self, time_segment=None):
+        iterator = self.database.get_dataset_train()
+
+        iterator = self.filter_iterator(iterator)
+
+        iterator = iterator.map(self.read_audio) \
+            .map(self.database.add_num_samples)
+        exclude_keys = None
+        iterator = iterator.map(self.to_train_structure)
+        unbatch = False
+        if self.opts.shuffle:
+            iterator = iterator.shuffle(reshuffle=True)
+        if self.opts.time_segments is not None or time_segment is not None:
+            assert not (self.opts.time_segments and time_segment)
+            iterator = iterator.map(
+                partial(self.segment, exclude_keys=exclude_keys))
+            unbatch = True
+        if not self.opts.multichannel:
+            segment_channels = partial(self.segment_channels,
+                                       exclude_keys=exclude_keys)
+        else:
+            segment_channels = False
+
+        return self.get_map_iterator(iterator, self.opts.batch_size,
+                                     segment_channels=segment_channels,
+                                     unbatch=unbatch)
+
+
+
+from padercontrib.database.wsj0_mix import WSJ0_2Mix_8k
+
+@ex.config
+def config():
+
+        use_pt = True
+        epochs = 2
+        provider_config = dict(
+            database=dict(factory=WSJ0_2Mix_8k),
+            audio_keys=[keys.OBSERVATION, keys.SPEECH_SOURCE],
+            batch_size=8,
+            time_segments=32000,
+            collate=dict(factory='padertorch.contrib.jensheit.data.Padder',
+                         padding=True,
+                         padding_keys=[keys.OBSERVATION, keys.SPEECH_SOURCE]),
+            batch_size_eval=1,
+            gender='all'
+        )
+        model_config = dict()
+        provider_config = Provider.get_config(provider_config)
+        model_config = TasnetModel.get_config(model_config)
+
+
+from padertorch.configurable import Configurable
+
+@ex.automain
+def main(use_pt,epochs, provider_config, model_config):
+    assert len(ex.current_run.observers) == 1, (
+        'FileObserver` missing. Add a `FileObserver` with `-F foo/bar/`.'
+    )
+    storage_dir = Path(ex.current_run.observers[0].basedir)
+
+    if use_pt:
+        model = TasnetModel.from_config(model_config)
+
+        optimizer = pt_opt.Adam()
+
+        provider = Configurable.from_config(provider_config)
+        provider.transform = transform
+
+        train_iterator = provider.get_train_iterator()
+        validation_iterator = provider.get_eval_iterator(num_examples=100)
+
+        trainer = Trainer(model,
+                          storage_dir=storage_dir,
+                          optimizer=optimizer,
+                          loss_weights=None,
+                          summary_trigger=(250, 'iteration'),
+                          checkpoint_trigger=(1000, 'iteration'),
+                          )
+
+        #trainer.test_run(train_iterator,
+        #                 validation_iterator)
+
+        trainer.register_validation_hook(validation_iterator)
+
+        trainer.train(train_iterator)
